@@ -145,6 +145,9 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 DISCORD_GUILD_ID = os.getenv('DISCORD_GUILD_ID')
 
+# OpenAI Configuration (optional, for summary feature)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 
