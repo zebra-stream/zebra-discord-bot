@@ -1,0 +1,8 @@
+Django==5.0.1
+discord.py==2.3.2
+python-dotenv==1.0.0
+psycopg2-binary==2.9.7
+Pillow==10.0.1
+asyncio-mqtt==0.13.0
+
+
