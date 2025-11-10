@@ -149,12 +149,6 @@ def migrate_data(sqlite_path=None, dry_run=False):
         print(f'  ✓ Read {len(messages_data)} messages')
         print(f'  ✓ Read {len(reactions_data)} reactions')
         
-        # Show message timestamps for debugging
-        if messages_data:
-            print('\n📅 Message timestamps:')
-            for msg in messages_data:
-                print(f'  - {msg["timestamp"]} (ID: {msg["message_id"]})')
-        
     finally:
         # Switch back to PostgreSQL
         settings.DATABASES['default'] = original_db_config
@@ -175,13 +169,19 @@ def migrate_data(sqlite_path=None, dry_run=False):
     print(f'  Reactions: {pg_reactions}')
     
     if pg_messages > 0:
-        response = input('\n⚠️  PostgreSQL already has data. Continue anyway? (yes/no): ')
-        if response.lower() != 'yes':
-            print('❌ Migration cancelled.')
-            return
+        print('\n⚠️  PostgreSQL already has data. Will import only missing records (safe to run).')
     
     # Now write to PostgreSQL
     print('\n🚀 Starting migration to PostgreSQL...\n')
+    
+    # Track statistics
+    stats = {
+        'servers': {'imported': 0, 'skipped': 0},
+        'channels': {'imported': 0, 'skipped': 0},
+        'users': {'imported': 0, 'skipped': 0},
+        'messages': {'imported': 0, 'skipped': 0},
+        'reactions': {'imported': 0, 'skipped': 0},
+    }
     
     with transaction.atomic():
         # 1. Migrate Servers
@@ -198,7 +198,10 @@ def migrate_data(sqlite_path=None, dry_run=False):
             )
             servers_map[server_data['server_id']] = pg_server
             if created:
-                print(f'  ✓ Migrated server: {server_data["name"]}')
+                stats['servers']['imported'] += 1
+                print(f'  ✓ Imported server: {server_data["name"]}')
+            else:
+                stats['servers']['skipped'] += 1
         
         # 2. Migrate Channels
         print('\n📦 Migrating Channels...')
@@ -217,7 +220,10 @@ def migrate_data(sqlite_path=None, dry_run=False):
             )
             channels_map[channel_data['channel_id']] = pg_channel
             if created:
-                print(f'  ✓ Migrated channel: {channel_data["name"]}')
+                stats['channels']['imported'] += 1
+                print(f'  ✓ Imported channel: {channel_data["name"]}')
+            else:
+                stats['channels']['skipped'] += 1
         
         # 3. Migrate Users
         print('\n📦 Migrating Users...')
@@ -237,13 +243,16 @@ def migrate_data(sqlite_path=None, dry_run=False):
             )
             users_map[user_data['user_id']] = pg_user
             if created:
-                print(f'  ✓ Migrated user: {user_data["username"]}')
+                stats['users']['imported'] += 1
+                print(f'  ✓ Imported user: {user_data["username"]}')
+            else:
+                stats['users']['skipped'] += 1
         
         # 4. Migrate Messages
         print('\n📦 Migrating Messages...')
         messages_map = {}  # Maps message_id to Django model instance
         total_messages = len(messages_data)
-        migrated_count = 0
+        processed_count = 0
         
         for message_data in messages_data:
             pg_channel = channels_map[message_data['channel_id']]
@@ -266,20 +275,25 @@ def migrate_data(sqlite_path=None, dry_run=False):
                 }
             )
             messages_map[message_data['message_id']] = pg_message
-            migrated_count += 1
+            processed_count += 1
             
-            if migrated_count % 100 == 0:
-                print(f'  ⏳ Migrated {migrated_count}/{total_messages} messages...')
+            if created:
+                stats['messages']['imported'] += 1
+            else:
+                stats['messages']['skipped'] += 1
+            
+            if processed_count % 100 == 0:
+                print(f'  ⏳ Processed {processed_count}/{total_messages} messages... (imported: {stats["messages"]["imported"]}, skipped: {stats["messages"]["skipped"]})')
         
-        print(f'  ✓ Migrated {migrated_count} messages')
+        print(f'  ✓ Processed {processed_count} messages (imported: {stats["messages"]["imported"]}, skipped: {stats["messages"]["skipped"]})')
         
         # 5. Migrate Reactions
         print('\n📦 Migrating Reactions...')
-        reactions_count = 0
+        processed_reactions = 0
         for reaction_data in reactions_data:
             pg_message = messages_map[reaction_data['message_id']]
             
-            DiscordReaction.objects.get_or_create(
+            reaction, created = DiscordReaction.objects.get_or_create(
                 message=pg_message,
                 emoji_name=reaction_data['emoji_name'],
                 emoji_id=reaction_data['emoji_id'],
@@ -288,15 +302,27 @@ def migrate_data(sqlite_path=None, dry_run=False):
                     'created_at': reaction_data['created_at'],
                 }
             )
-            reactions_count += 1
+            processed_reactions += 1
+            if created:
+                stats['reactions']['imported'] += 1
+            else:
+                stats['reactions']['skipped'] += 1
         
-        print(f'  ✓ Migrated {reactions_count} reactions')
+        print(f'  ✓ Processed {processed_reactions} reactions (imported: {stats["reactions"]["imported"]}, skipped: {stats["reactions"]["skipped"]})')
     
     # Final summary
     print('\n' + '='*50)
     print('✅ Migration completed successfully!')
     print('='*50)
-    print(f'\n📊 Final counts in PostgreSQL:')
+    
+    print('\n📊 Import Summary:')
+    print(f'  Servers:   {stats["servers"]["imported"]} imported, {stats["servers"]["skipped"]} skipped')
+    print(f'  Channels:  {stats["channels"]["imported"]} imported, {stats["channels"]["skipped"]} skipped')
+    print(f'  Users:     {stats["users"]["imported"]} imported, {stats["users"]["skipped"]} skipped')
+    print(f'  Messages:  {stats["messages"]["imported"]} imported, {stats["messages"]["skipped"]} skipped')
+    print(f'  Reactions: {stats["reactions"]["imported"]} imported, {stats["reactions"]["skipped"]} skipped')
+    
+    print('\n📊 Final counts in PostgreSQL:')
     print(f'  Servers: {DiscordServer.objects.count()}')
     print(f'  Channels: {DiscordChannel.objects.count()}')
     print(f'  Users: {DiscordUser.objects.count()}')
