@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Standalone script to migrate data from SQLite to PostgreSQL.
-
-Usage:
-    python migrate_psql.py
+Fixed migration script that reads SQLite directly (bypassing Django ORM issues)
+and imports to PostgreSQL.
 """
 import os
 import sys
 import django
+import sqlite3
 from pathlib import Path
+from datetime import datetime
 
 # Add the project directory to Python path
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,17 +19,22 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'discord_intelligence.settings')
 django.setup()
 
 # Now we can import Django models
-from django.db import connections, transaction
+from django.db import transaction
 from django.conf import settings
 from bot.models import DiscordServer, DiscordChannel, DiscordUser, DiscordMessage, DiscordReaction
 
 
 def migrate_data(sqlite_path=None, dry_run=False):
-    """Migrate all data from SQLite to PostgreSQL"""
+    """Migrate all data from SQLite to PostgreSQL using raw SQLite queries"""
     
-    # Determine SQLite path
+    # Determine SQLite path - check for olddb.sqlite3 first, then db.sqlite3
     if not sqlite_path:
-        sqlite_path = BASE_DIR / 'db.sqlite3'
+        old_db_path = BASE_DIR / 'olddb.sqlite3'
+        if old_db_path.exists():
+            sqlite_path = old_db_path
+            print(f'📦 Found olddb.sqlite3, using that for migration')
+        else:
+            sqlite_path = BASE_DIR / 'db.sqlite3'
     else:
         sqlite_path = Path(sqlite_path)
     
@@ -44,26 +49,24 @@ def migrate_data(sqlite_path=None, dry_run=False):
         print('❌ PostgreSQL is not enabled. Set USE_POSTGRESQL=True in your .env file.')
         return
     
-    # Store original database config
-    original_db_config = settings.DATABASES['default'].copy()
-    
-    # Temporarily switch to SQLite to read data
-    settings.DATABASES['default'] = {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': str(sqlite_path),
-    }
-    
-    # Close existing connections and reconnect
-    connections.close_all()
+    # Connect directly to SQLite using sqlite3 (bypassing Django)
+    sqlite_conn = sqlite3.connect(str(sqlite_path))
+    sqlite_conn.row_factory = sqlite3.Row  # Return rows as dict-like objects
+    sqlite_cursor = sqlite_conn.cursor()
     
     try:
         # Count records in SQLite
         print('\n📊 Counting records in SQLite database...')
-        sqlite_servers = DiscordServer.objects.count()
-        sqlite_channels = DiscordChannel.objects.count()
-        sqlite_users = DiscordUser.objects.count()
-        sqlite_messages = DiscordMessage.objects.count()
-        sqlite_reactions = DiscordReaction.objects.count()
+        sqlite_cursor.execute('SELECT COUNT(*) FROM discord_servers')
+        sqlite_servers = sqlite_cursor.fetchone()[0]
+        sqlite_cursor.execute('SELECT COUNT(*) FROM discord_channels')
+        sqlite_channels = sqlite_cursor.fetchone()[0]
+        sqlite_cursor.execute('SELECT COUNT(*) FROM discord_users')
+        sqlite_users = sqlite_cursor.fetchone()[0]
+        sqlite_cursor.execute('SELECT COUNT(*) FROM discord_messages')
+        sqlite_messages = sqlite_cursor.fetchone()[0]
+        sqlite_cursor.execute('SELECT COUNT(*) FROM discord_reactions')
+        sqlite_reactions = sqlite_cursor.fetchone()[0]
         
         print(f'  Servers: {sqlite_servers}')
         print(f'  Channels: {sqlite_channels}')
@@ -75,73 +78,28 @@ def migrate_data(sqlite_path=None, dry_run=False):
             print('\n🔍 DRY RUN - No data will be migrated')
             return
         
-        # Read all data from SQLite into memory
+        # Read all data from SQLite
         print('\n📖 Reading data from SQLite...')
         
         # Read Servers
-        servers_data = []
-        for server in DiscordServer.objects.all():
-            servers_data.append({
-                'server_id': server.server_id,
-                'name': server.name,
-                'created_at': server.created_at,
-                'updated_at': server.updated_at,
-            })
+        sqlite_cursor.execute('SELECT * FROM discord_servers')
+        servers_data = [dict(row) for row in sqlite_cursor.fetchall()]
         
-        # Read Channels (with server_id reference)
-        channels_data = []
-        for channel in DiscordChannel.objects.select_related('server').all():
-            channels_data.append({
-                'channel_id': channel.channel_id,
-                'server_id': channel.server.server_id,  # Store server_id for lookup
-                'name': channel.name,
-                'channel_type': channel.channel_type,
-                'created_at': channel.created_at,
-                'updated_at': channel.updated_at,
-            })
+        # Read Channels
+        sqlite_cursor.execute('SELECT * FROM discord_channels')
+        channels_data = [dict(row) for row in sqlite_cursor.fetchall()]
         
         # Read Users
-        users_data = []
-        for user in DiscordUser.objects.all():
-            users_data.append({
-                'user_id': user.user_id,
-                'username': user.username,
-                'display_name': user.display_name,
-                'discriminator': user.discriminator,
-                'avatar_url': user.avatar_url,
-                'is_bot': user.is_bot,
-                'created_at': user.created_at,
-                'updated_at': user.updated_at,
-            })
+        sqlite_cursor.execute('SELECT * FROM discord_users')
+        users_data = [dict(row) for row in sqlite_cursor.fetchall()]
         
-        # Read Messages (with channel_id and user_id references)
-        messages_data = []
-        for message in DiscordMessage.objects.select_related('channel', 'author').all():
-            messages_data.append({
-                'message_id': message.message_id,
-                'channel_id': message.channel.channel_id,  # Store channel_id for lookup
-                'user_id': message.author.user_id,  # Store user_id for lookup
-                'content': message.content,
-                'timestamp': message.timestamp,
-                'edited_timestamp': message.edited_timestamp,
-                'is_pinned': message.is_pinned,
-                'has_attachments': message.has_attachments,
-                'attachment_count': message.attachment_count,
-                'has_embeds': message.has_embeds,
-                'embed_count': message.embed_count,
-                'created_at': message.created_at,
-            })
+        # Read Messages
+        sqlite_cursor.execute('SELECT * FROM discord_messages ORDER BY timestamp')
+        messages_data = [dict(row) for row in sqlite_cursor.fetchall()]
         
-        # Read Reactions (with message_id reference)
-        reactions_data = []
-        for reaction in DiscordReaction.objects.select_related('message').all():
-            reactions_data.append({
-                'message_id': reaction.message.message_id,  # Store message_id for lookup
-                'emoji_name': reaction.emoji_name,
-                'emoji_id': reaction.emoji_id,
-                'count': reaction.count,
-                'created_at': reaction.created_at,
-            })
+        # Read Reactions
+        sqlite_cursor.execute('SELECT * FROM discord_reactions')
+        reactions_data = [dict(row) for row in sqlite_cursor.fetchall()]
         
         print(f'  ✓ Read {len(servers_data)} servers')
         print(f'  ✓ Read {len(channels_data)} channels')
@@ -150,9 +108,7 @@ def migrate_data(sqlite_path=None, dry_run=False):
         print(f'  ✓ Read {len(reactions_data)} reactions')
         
     finally:
-        # Switch back to PostgreSQL
-        settings.DATABASES['default'] = original_db_config
-        connections.close_all()
+        sqlite_conn.close()
     
     # Check PostgreSQL counts
     print('\n📊 Checking PostgreSQL database...')
@@ -206,8 +162,34 @@ def migrate_data(sqlite_path=None, dry_run=False):
         # 2. Migrate Channels
         print('\n📦 Migrating Channels...')
         channels_map = {}  # Maps channel_id to Django model instance
+        
+        # Reconnect to SQLite to resolve foreign keys
+        sqlite_conn = sqlite3.connect(str(sqlite_path))
+        sqlite_cursor = sqlite_conn.cursor()
+        
         for channel_data in channels_data:
-            pg_server = servers_map[channel_data['server_id']]
+            # server_id might be Django's internal ID, need to look up the actual Discord server_id
+            server_id_fk = channel_data['server_id']
+            
+            # Check if it's already a Discord server_id (large number) or Django internal ID (small number)
+            if server_id_fk < 1000:  # Likely Django internal ID
+                # Look up the actual Discord server_id
+                sqlite_cursor.execute('SELECT server_id FROM discord_servers WHERE id = ?', (server_id_fk,))
+                result = sqlite_cursor.fetchone()
+                if result:
+                    server_id = result[0]
+                else:
+                    print(f'  ⚠️  Warning: Could not find server with Django id {server_id_fk} for channel {channel_data.get("name", "unknown")}')
+                    continue
+            else:
+                # It's already a Discord server_id
+                server_id = server_id_fk
+            
+            pg_server = servers_map.get(server_id)
+            if not pg_server:
+                print(f'  ⚠️  Warning: Could not find server {server_id} for channel {channel_data.get("name", "unknown")}')
+                continue
+                
             pg_channel, created = DiscordChannel.objects.get_or_create(
                 channel_id=channel_data['channel_id'],
                 defaults={
@@ -233,10 +215,10 @@ def migrate_data(sqlite_path=None, dry_run=False):
                 user_id=user_data['user_id'],
                 defaults={
                     'username': user_data['username'],
-                    'display_name': user_data['display_name'],
-                    'discriminator': user_data['discriminator'],
-                    'avatar_url': user_data['avatar_url'],
-                    'is_bot': user_data['is_bot'],
+                    'display_name': user_data.get('display_name', ''),
+                    'discriminator': user_data.get('discriminator', ''),
+                    'avatar_url': user_data.get('avatar_url', ''),
+                    'is_bot': user_data.get('is_bot', False),
                     'created_at': user_data['created_at'],
                     'updated_at': user_data['updated_at'],
                 }
@@ -255,23 +237,58 @@ def migrate_data(sqlite_path=None, dry_run=False):
         processed_count = 0
         
         for message_data in messages_data:
-            pg_channel = channels_map[message_data['channel_id']]
-            pg_author = users_map[message_data['user_id']]
+            # channel_id and author_id might be Django internal IDs, need to resolve them
+            channel_id_fk = message_data['channel_id']
+            author_id_fk = message_data['author_id']
+            
+            # Resolve channel_id
+            if channel_id_fk < 1000:  # Likely Django internal ID
+                sqlite_cursor.execute('SELECT channel_id FROM discord_channels WHERE id = ?', (channel_id_fk,))
+                result = sqlite_cursor.fetchone()
+                if result:
+                    channel_id = result[0]
+                else:
+                    print(f'  ⚠️  Warning: Could not find channel with Django id {channel_id_fk} for message {message_data["message_id"]}')
+                    continue
+            else:
+                channel_id = channel_id_fk
+            
+            # Resolve author_id
+            if author_id_fk < 1000:  # Likely Django internal ID
+                sqlite_cursor.execute('SELECT user_id FROM discord_users WHERE id = ?', (author_id_fk,))
+                result = sqlite_cursor.fetchone()
+                if result:
+                    user_id = result[0]
+                else:
+                    print(f'  ⚠️  Warning: Could not find user with Django id {author_id_fk} for message {message_data["message_id"]}')
+                    continue
+            else:
+                user_id = author_id_fk
+            
+            pg_channel = channels_map.get(channel_id)
+            pg_author = users_map.get(user_id)
+            
+            if not pg_channel:
+                print(f'  ⚠️  Warning: Could not find channel {channel_id} for message {message_data["message_id"]}')
+                continue
+            if not pg_author:
+                print(f'  ⚠️  Warning: Could not find user {user_id} for message {message_data["message_id"]}')
+                continue
             
             pg_message, created = DiscordMessage.objects.get_or_create(
                 message_id=message_data['message_id'],
                 defaults={
                     'channel': pg_channel,
                     'author': pg_author,
-                    'content': message_data['content'],
+                    'content': message_data['content'] or '',
                     'timestamp': message_data['timestamp'],
-                    'edited_timestamp': message_data['edited_timestamp'],
-                    'is_pinned': message_data['is_pinned'],
-                    'has_attachments': message_data['has_attachments'],
-                    'attachment_count': message_data['attachment_count'],
-                    'has_embeds': message_data['has_embeds'],
-                    'embed_count': message_data['embed_count'],
-                    'created_at': message_data['created_at'],
+                    'edited_timestamp': message_data.get('edited_timestamp'),
+                    'is_pinned': message_data.get('is_pinned', False),
+                    'has_attachments': message_data.get('has_attachments', False),
+                    'attachment_count': message_data.get('attachment_count', 0),
+                    'has_embeds': message_data.get('has_embeds', False),
+                    'embed_count': message_data.get('embed_count', 0),
+                    'created_at': message_data.get('created_at', message_data['timestamp']),
                 }
             )
             messages_map[message_data['message_id']] = pg_message
@@ -282,24 +299,47 @@ def migrate_data(sqlite_path=None, dry_run=False):
             else:
                 stats['messages']['skipped'] += 1
             
-            if processed_count % 100 == 0:
+            if processed_count % 10 == 0:
                 print(f'  ⏳ Processed {processed_count}/{total_messages} messages... (imported: {stats["messages"]["imported"]}, skipped: {stats["messages"]["skipped"]})')
+        
+        sqlite_conn.close()
         
         print(f'  ✓ Processed {processed_count} messages (imported: {stats["messages"]["imported"]}, skipped: {stats["messages"]["skipped"]})')
         
         # 5. Migrate Reactions
         print('\n📦 Migrating Reactions...')
         processed_reactions = 0
+        sqlite_conn = sqlite3.connect(str(sqlite_path))
+        sqlite_cursor = sqlite_conn.cursor()
+        
         for reaction_data in reactions_data:
-            pg_message = messages_map[reaction_data['message_id']]
+            # message_id is stored as a bigint (external ID) in the reactions table
+            # But we need to check the actual schema first
+            # Let's query to get the message_id
+            reaction_id = reaction_data.get('id')
+            sqlite_cursor.execute('SELECT message_id FROM discord_reactions WHERE id = ?', (reaction_id,))
+            result = sqlite_cursor.fetchone()
+            if not result:
+                continue
+            # message_id in reactions table is the Django internal ID, need to look up the actual message_id
+            django_message_id = result[0]
+            sqlite_cursor.execute('SELECT message_id FROM discord_messages WHERE id = ?', (django_message_id,))
+            result = sqlite_cursor.fetchone()
+            if not result:
+                continue
+            actual_message_id = result[0]
+            
+            pg_message = messages_map.get(actual_message_id)
+            if not pg_message:
+                continue
             
             reaction, created = DiscordReaction.objects.get_or_create(
                 message=pg_message,
                 emoji_name=reaction_data['emoji_name'],
-                emoji_id=reaction_data['emoji_id'],
+                emoji_id=reaction_data.get('emoji_id'),
                 defaults={
-                    'count': reaction_data['count'],
-                    'created_at': reaction_data['created_at'],
+                    'count': reaction_data.get('count', 1),
+                    'created_at': reaction_data.get('created_at'),
                 }
             )
             processed_reactions += 1
@@ -307,6 +347,8 @@ def migrate_data(sqlite_path=None, dry_run=False):
                 stats['reactions']['imported'] += 1
             else:
                 stats['reactions']['skipped'] += 1
+        
+        sqlite_conn.close()
         
         print(f'  ✓ Processed {processed_reactions} reactions (imported: {stats["reactions"]["imported"]}, skipped: {stats["reactions"]["skipped"]})')
     

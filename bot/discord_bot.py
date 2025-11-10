@@ -1,14 +1,19 @@
 import discord
 from discord.ext import commands
+from discord.sinks import WaveSink
 import asyncio
 import logging
+import os
+import tempfile
+import uuid
+from pathlib import Path
 from django.conf import settings
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist
 from asgiref.sync import sync_to_async
 from datetime import datetime, timedelta, timezone
-from .models import DiscordServer, DiscordChannel, DiscordUser, DiscordMessage, DiscordReaction
-from typing import Optional
+from .models import DiscordServer, DiscordChannel, DiscordUser, DiscordMessage, DiscordReaction, VoiceSession, VoiceTranscription
+from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +122,457 @@ class SummaryCog(commands.Cog):
                 await ctx.send(f"🦓 **Oops!** Something went wrong while creating the summary. Error: {str(e)}")
 
 
+class VoiceRecorder:
+    """Handles voice channel recording and transcription"""
+    
+    def __init__(self, bot):
+        self.bot = bot
+        self.active_sessions: Dict[int, VoiceSession] = {}  # channel_id -> VoiceSession
+        self.voice_clients: Dict[int, discord.VoiceClient] = {}  # channel_id -> VoiceClient
+        self.sinks: Dict[int, WaveSink] = {}  # channel_id -> Sink
+        self.transcription_tasks: Dict[int, asyncio.Task] = {}  # channel_id -> Task
+    
+    async def start_recording(self, voice_channel: discord.VoiceChannel, text_channel: discord.TextChannel) -> tuple[bool, str]:
+        """Start recording a voice channel"""
+        if not settings.VOICE_TRANSCRIPTION_ENABLED:
+            return False, "Voice transcription is disabled"
+        
+        if voice_channel.id in self.active_sessions:
+            return False, "Already recording in this channel"
+        
+        try:
+            # Connect to voice channel
+            voice_client = await voice_channel.connect()
+            self.voice_clients[voice_channel.id] = voice_client
+            
+            # Create sink for recording
+            sink = WaveSink()
+            voice_client.start_recording(
+                sink,
+                self._finished_callback,
+                sync_start=False
+            )
+            self.sinks[voice_channel.id] = sink
+            
+            # Create database session
+            db_channel = await self.bot.get_or_create_channel(voice_channel)
+            session_id = str(uuid.uuid4())
+            
+            def create_session():
+                return VoiceSession.objects.create(
+                    session_id=session_id,
+                    channel=db_channel,
+                    status='active'
+                )
+            
+            voice_session = await sync_to_async(create_session)()
+            self.active_sessions[voice_channel.id] = voice_session
+            
+            # Start transcription task
+            task = asyncio.create_task(self._transcribe_audio_loop(voice_channel.id, sink))
+            self.transcription_tasks[voice_channel.id] = task
+            
+            logger.info(f"Started recording voice channel {voice_channel.name} (ID: {voice_channel.id})")
+            return True, f"🦓 **Recording started!** I'm now transcribing #{voice_channel.name} in real-time."
+            
+        except Exception as e:
+            logger.error(f"Error starting recording: {e}")
+            return False, f"Error starting recording: {str(e)}"
+    
+    async def stop_recording(self, channel_id: int) -> tuple[bool, str]:
+        """Stop recording a voice channel"""
+        if channel_id not in self.active_sessions:
+            return False, "No active recording in this channel"
+        
+        try:
+            # Stop transcription task
+            if channel_id in self.transcription_tasks:
+                self.transcription_tasks[channel_id].cancel()
+                try:
+                    await self.transcription_tasks[channel_id]
+                except asyncio.CancelledError:
+                    pass
+                del self.transcription_tasks[channel_id]
+            
+            # Stop recording
+            if channel_id in self.voice_clients:
+                voice_client = self.voice_clients[channel_id]
+                voice_client.stop_recording()
+                await voice_client.disconnect()
+                del self.voice_clients[channel_id]
+            
+            # Clean up sink
+            if channel_id in self.sinks:
+                del self.sinks[channel_id]
+            
+            # Update session status
+            session = self.active_sessions[channel_id]
+            
+            def update_session():
+                session.status = 'completed'
+                session.ended_at = datetime.now(timezone.utc)
+                session.save()
+            
+            await sync_to_async(update_session)()
+            del self.active_sessions[channel_id]
+            
+            logger.info(f"Stopped recording channel {channel_id}")
+            return True, "🦓 **Recording stopped!** Generating notes..."
+            
+        except Exception as e:
+            logger.error(f"Error stopping recording: {e}")
+            return False, f"Error stopping recording: {str(e)}"
+    
+    async def _finished_callback(self, sink, user_id, *args):
+        """Callback when audio packet is finished"""
+        # This is called for each user's audio packet
+        # We'll handle transcription in the main loop
+        pass
+    
+    async def _transcribe_audio_loop(self, channel_id: int, sink: WaveSink):
+        """Continuously transcribe audio chunks"""
+        chunk_duration = settings.TRANSCRIPTION_CHUNK_DURATION
+        session = self.active_sessions.get(channel_id)
+        
+        if not session:
+            return
+        
+        try:
+            while channel_id in self.active_sessions:
+                await asyncio.sleep(chunk_duration)
+                
+                if channel_id not in self.active_sessions:
+                    break
+                
+                # Get audio data from sink
+                # WaveSink stores audio in a dict: {user_id: file_path}
+                audio_data = {}
+                if hasattr(sink, 'audio_data') and sink.audio_data:
+                    for user_id, audio_file in sink.audio_data.items():
+                        if audio_file and os.path.exists(audio_file):
+                            audio_data[user_id] = audio_file
+                
+                if not audio_data:
+                    continue
+                
+                # Transcribe each user's audio
+                for user_id, audio_file in audio_data.items():
+                    try:
+                        transcription = await self._transcribe_audio(audio_file, user_id, session)
+                        if transcription:
+                            await self._store_transcription(transcription, session, user_id)
+                    except Exception as e:
+                        logger.error(f"Error transcribing audio for user {user_id}: {e}")
+                
+                # Note: Don't clear audio_data here as it's managed by the sink
+                # The sink will handle cleanup when recording stops
+                
+        except asyncio.CancelledError:
+            logger.info(f"Transcription loop cancelled for channel {channel_id}")
+        except Exception as e:
+            logger.error(f"Error in transcription loop: {e}")
+    
+    async def _transcribe_audio(self, audio_file, user_id: int, session: VoiceSession) -> Optional[str]:
+        """Transcribe audio using OpenAI Whisper"""
+        if not settings.OPENAI_API_KEY:
+            logger.warning("OpenAI API key not set, skipping transcription")
+            return None
+        
+        if not os.path.exists(audio_file):
+            logger.warning(f"Audio file not found: {audio_file}")
+            return None
+        
+        try:
+            from openai import AsyncOpenAI
+            
+            client = AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                base_url="https://api.openai.com/v1",
+                timeout=60.0
+            )
+            
+            # Read audio file
+            with open(audio_file, 'rb') as f:
+                audio_data = f.read()
+            
+            # Skip if file is too small (likely silence or empty)
+            if len(audio_data) < 1000:  # Less than 1KB is probably empty
+                return None
+            
+            # Transcribe using Whisper
+            transcript = await client.audio.transcriptions.create(
+                model=settings.WHISPER_MODEL,
+                file=(os.path.basename(audio_file), audio_data, 'audio/wav'),
+                language='en'  # Can be made configurable
+            )
+            
+            text = transcript.text.strip()
+            if not text:
+                return None
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Error in Whisper transcription: {e}")
+            return None
+    
+    async def _store_transcription(self, text: str, session: VoiceSession, user_id: int):
+        """Store transcription in database"""
+        if not text:
+            return
+        
+        try:
+            # Get or create user
+            def get_user():
+                try:
+                    return DiscordUser.objects.get(user_id=user_id)
+                except ObjectDoesNotExist:
+                    return None
+            
+            user = await sync_to_async(get_user)()
+            
+            def create_transcription():
+                return VoiceTranscription.objects.create(
+                    session=session,
+                    user=user,
+                    text=text,
+                    timestamp=datetime.now(timezone.utc)
+                )
+            
+            await sync_to_async(create_transcription)()
+            logger.info(f"Stored transcription: {text[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Error storing transcription: {e}")
+    
+    async def generate_notes(self, session_id: str) -> tuple[bool, str]:
+        """Generate structured notes from a completed session"""
+        try:
+            def get_session():
+                try:
+                    return VoiceSession.objects.get(session_id=session_id, status='completed')
+                except ObjectDoesNotExist:
+                    return None
+            
+            session = await sync_to_async(get_session)()
+            
+            if not session:
+                return False, "Session not found or not completed"
+            
+            if session.notes_generated:
+                return True, session.notes or "Notes already generated"
+            
+            # Get all transcriptions
+            def get_transcriptions():
+                return list(VoiceTranscription.objects.filter(session=session).order_by('timestamp'))
+            
+            transcriptions = await sync_to_async(get_transcriptions)()
+            
+            if not transcriptions:
+                return False, "No transcriptions found for this session"
+            
+            # Build full transcript
+            transcript_text = []
+            for trans in transcriptions:
+                user_name = trans.user.display_name or trans.user.username if trans.user else "Unknown"
+                timestamp_str = trans.timestamp.strftime("%H:%M:%S")
+                transcript_text.append(f"[{timestamp_str}] {user_name}: {trans.text}")
+            
+            full_transcript = "\n".join(transcript_text)
+            
+            # Generate structured notes using OpenAI
+            notes = await self._generate_structured_notes(full_transcript, len(transcriptions))
+            
+            # Store notes
+            def update_session():
+                session.notes = notes
+                session.notes_generated = True
+                session.save()
+            
+            await sync_to_async(update_session)()
+            
+            return True, notes
+            
+        except Exception as e:
+            logger.error(f"Error generating notes: {e}")
+            return False, f"Error generating notes: {str(e)}"
+    
+    async def _generate_structured_notes(self, transcript: str, segment_count: int) -> str:
+        """Generate structured notes from transcript using OpenAI"""
+        if not settings.OPENAI_API_KEY:
+            return "⚠️ OpenAI API key not configured. Cannot generate structured notes."
+        
+        try:
+            from openai import AsyncOpenAI
+            
+            client = AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                base_url="https://api.openai.com/v1",
+                timeout=60.0
+            )
+            
+            prompt = f"""Analyze this voice conversation transcript and create structured notes. Extract:
+
+1. **Action Items** - Tasks that need to be done (who, what, when)
+2. **Decisions Made** - Important decisions and agreements
+3. **Key Topics** - Main discussion points and themes
+4. **Summary** - Brief overview of the conversation
+
+Format the output clearly with sections. Be concise but comprehensive.
+
+Transcript ({segment_count} segments):
+{transcript[:15000]}  # Limit to avoid token limits
+
+Create structured notes now:"""
+            
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that creates clear, structured meeting notes from transcripts."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Error generating structured notes: {e}")
+            return f"⚠️ Error generating notes: {str(e)}"
+
+
+class VoiceTranscriptionCog(commands.Cog):
+    """Cog for voice channel transcription commands"""
+    
+    def __init__(self, bot):
+        self.bot = bot
+        self.recorder = VoiceRecorder(bot)
+    
+    @commands.command(name='join')
+    async def join_command(self, ctx):
+        """
+        Join the voice channel you're currently in and start transcribing 🦓
+        
+        Usage:
+            !join - Join your current voice channel
+        """
+        if not ctx.author.voice:
+            await ctx.send("🦓 **Oops!** You need to be in a voice channel first!")
+            return
+        
+        voice_channel = ctx.author.voice.channel
+        success, message = await self.recorder.start_recording(voice_channel, ctx.channel)
+        await ctx.send(message)
+    
+    @commands.command(name='leave')
+    async def leave_command(self, ctx):
+        """
+        Leave the current voice channel and stop recording 🦓
+        
+        Usage:
+            !leave - Stop recording and leave voice channel
+        """
+        # Find active session in any channel the user might be in
+        if ctx.author.voice:
+            channel_id = ctx.author.voice.channel.id
+            if channel_id in self.recorder.active_sessions:
+                # Get session ID before stopping
+                session = self.recorder.active_sessions.get(channel_id)
+                session_id = session.session_id if session else None
+                
+                success, message = await self.recorder.stop_recording(channel_id)
+                await ctx.send(message)
+                
+                # Generate notes automatically after leaving
+                if session_id:
+                    await asyncio.sleep(2)  # Brief delay for final transcriptions
+                    notes_success, notes = await self.recorder.generate_notes(session_id)
+                    if notes_success:
+                        embed = discord.Embed(
+                            title="🦓 **Meeting Notes** 🦓",
+                            description=notes[:2000],  # Discord embed limit
+                            color=0x000000
+                        )
+                        await ctx.send(embed=embed)
+                return
+        
+        # If user not in voice, check if bot is recording anywhere
+        if not self.recorder.active_sessions:
+            await ctx.send("🦓 **Not recording** - I'm not in any voice channels right now!")
+            return
+        
+        # Leave the first active session (or could be improved to list all)
+        channel_id = list(self.recorder.active_sessions.keys())[0]
+        session = self.recorder.active_sessions.get(channel_id)
+        session_id = session.session_id if session else None
+        
+        success, message = await self.recorder.stop_recording(channel_id)
+        await ctx.send(message)
+        
+        # Generate notes if session existed
+        if session_id:
+            await asyncio.sleep(2)
+            notes_success, notes = await self.recorder.generate_notes(session_id)
+            if notes_success:
+                embed = discord.Embed(
+                    title="🦓 **Meeting Notes** 🦓",
+                    description=notes[:2000],
+                    color=0x000000
+                )
+                await ctx.send(embed=embed)
+    
+    @commands.command(name='notes')
+    async def notes_command(self, ctx, session_id: Optional[str] = None):
+        """
+        Generate structured notes from a completed voice session 🦓
+        
+        Usage:
+            !notes - Generate notes for the most recent session
+            !notes <session_id> - Generate notes for a specific session
+        """
+        async with ctx.typing():
+            if session_id:
+                success, notes = await self.recorder.generate_notes(session_id)
+            else:
+                # Get most recent completed session
+                def get_recent_session():
+                    return VoiceSession.objects.filter(
+                        status='completed',
+                        channel__server__server_id=ctx.guild.id
+                    ).order_by('-ended_at').first()
+                
+                session = await sync_to_async(get_recent_session)()
+                
+                if not session:
+                    await ctx.send("🦓 **No completed sessions found!** Try specifying a session ID.")
+                    return
+                
+                success, notes = await self.recorder.generate_notes(session.session_id)
+            
+            if success:
+                # Split if too long for embed
+                if len(notes) > 2000:
+                    # Send as multiple embeds or as file
+                    embed = discord.Embed(
+                        title="🦓 **Meeting Notes** 🦓",
+                        description=notes[:2000],
+                        color=0x000000
+                    )
+                    await ctx.send(embed=embed)
+                    if len(notes) > 2000:
+                        await ctx.send(f"```\n{notes[2000:4000]}\n```")
+                else:
+                    embed = discord.Embed(
+                        title="🦓 **Meeting Notes** 🦓",
+                        description=notes,
+                        color=0x000000
+                    )
+                    await ctx.send(embed=embed)
+            else:
+                await ctx.send(f"🦓 **Error:** {notes}")
+
+
 class DiscordIntelligenceBot(commands.Bot):
     """Discord bot for monitoring and storing server activity"""
     
@@ -142,6 +598,16 @@ class DiscordIntelligenceBot(commands.Bot):
             logger.info('SummaryCog loaded successfully')
         except Exception as e:
             logger.error(f'Error loading SummaryCog: {e}')
+        
+        # Load the voice transcription Cog
+        if settings.VOICE_TRANSCRIPTION_ENABLED:
+            try:
+                await self.add_cog(VoiceTranscriptionCog(self))
+                logger.info('VoiceTranscriptionCog loaded successfully')
+            except Exception as e:
+                logger.error(f'Error loading VoiceTranscriptionCog: {e}')
+        else:
+            logger.info('Voice transcription is disabled')
         
         # Log registered commands for debugging (after Cog is loaded)
         logger.info(f'Registered commands: {[cmd.name for cmd in self.commands]}')

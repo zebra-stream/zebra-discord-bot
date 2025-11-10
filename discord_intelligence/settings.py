@@ -148,6 +148,11 @@ DISCORD_GUILD_ID = os.getenv('DISCORD_GUILD_ID')
 # OpenAI Configuration (optional, for summary feature)
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+# Voice Transcription Configuration
+VOICE_TRANSCRIPTION_ENABLED = os.getenv('VOICE_TRANSCRIPTION_ENABLED', 'True').lower() == 'true'
+WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'whisper-1')
+TRANSCRIPTION_CHUNK_DURATION = int(os.getenv('TRANSCRIPTION_CHUNK_DURATION', '30'))  # seconds
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 

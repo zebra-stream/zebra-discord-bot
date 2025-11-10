@@ -92,3 +92,50 @@ class DiscordReaction(models.Model):
     
     def __str__(self):
         return f"{self.emoji_name} x{self.count} on message {self.message.message_id}"
+
+
+class VoiceSession(models.Model):
+    """Represents a voice channel recording session"""
+    session_id = models.CharField(max_length=100, unique=True)
+    channel = models.ForeignKey(DiscordChannel, on_delete=models.CASCADE, related_name='voice_sessions')
+    started_at = models.DateTimeField(auto_now_add=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=20, default='active')  # active, completed, cancelled
+    notes = models.TextField(blank=True, null=True)
+    notes_generated = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'voice_sessions'
+        ordering = ['-started_at']
+        indexes = [
+            models.Index(fields=['channel', 'started_at']),
+            models.Index(fields=['status']),
+        ]
+    
+    def __str__(self):
+        return f"Voice session in #{self.channel.name} - {self.started_at}"
+
+
+class VoiceTranscription(models.Model):
+    """Represents a transcription segment from a voice session"""
+    session = models.ForeignKey(VoiceSession, on_delete=models.CASCADE, related_name='transcriptions')
+    user = models.ForeignKey(DiscordUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='voice_transcriptions')
+    text = models.TextField()
+    timestamp = models.DateTimeField()
+    duration = models.FloatField(null=True, blank=True)  # Duration in seconds
+    confidence = models.FloatField(null=True, blank=True)  # Transcription confidence score
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'voice_transcriptions'
+        ordering = ['timestamp']
+        indexes = [
+            models.Index(fields=['session', 'timestamp']),
+            models.Index(fields=['user', 'timestamp']),
+        ]
+    
+    def __str__(self):
+        user_name = self.user.username if self.user else "Unknown"
+        return f"{user_name}: {self.text[:50]}..."
