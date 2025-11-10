@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands
-from discord.sinks import WaveSink
 import asyncio
 import logging
 import os
@@ -16,6 +15,15 @@ from .models import DiscordServer, DiscordChannel, DiscordUser, DiscordMessage, 
 from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
+
+# Try to import WaveSink for voice recording
+try:
+    from discord.sinks import WaveSink
+    VOICE_AVAILABLE = True
+except ImportError:
+    WaveSink = None
+    VOICE_AVAILABLE = False
+    logger.warning("discord.sinks not available. Voice transcription will be disabled. Install discord.py[voice] to enable.")
 
 
 class SummaryCog(commands.Cog):
@@ -126,6 +134,9 @@ class VoiceRecorder:
     """Handles voice channel recording and transcription"""
     
     def __init__(self, bot):
+        if not VOICE_AVAILABLE:
+            raise ImportError("Voice recording requires discord.py[voice] to be installed. Run: pip install 'discord.py[voice]'")
+        
         self.bot = bot
         self.active_sessions: Dict[int, VoiceSession] = {}  # channel_id -> VoiceSession
         self.voice_clients: Dict[int, discord.VoiceClient] = {}  # channel_id -> VoiceClient
@@ -447,6 +458,8 @@ class VoiceTranscriptionCog(commands.Cog):
     
     def __init__(self, bot):
         self.bot = bot
+        if not VOICE_AVAILABLE:
+            raise ImportError("Voice recording requires discord.py[voice] to be installed. Run: pip install 'discord.py[voice]'")
         self.recorder = VoiceRecorder(bot)
     
     @commands.command(name='join')
@@ -601,11 +614,14 @@ class DiscordIntelligenceBot(commands.Bot):
         
         # Load the voice transcription Cog
         if settings.VOICE_TRANSCRIPTION_ENABLED:
-            try:
-                await self.add_cog(VoiceTranscriptionCog(self))
-                logger.info('VoiceTranscriptionCog loaded successfully')
-            except Exception as e:
-                logger.error(f'Error loading VoiceTranscriptionCog: {e}')
+            if VOICE_AVAILABLE:
+                try:
+                    await self.add_cog(VoiceTranscriptionCog(self))
+                    logger.info('VoiceTranscriptionCog loaded successfully')
+                except Exception as e:
+                    logger.error(f'Error loading VoiceTranscriptionCog: {e}')
+            else:
+                logger.warning('Voice transcription is enabled but discord.sinks is not available. Install discord.py[voice] to enable voice features.')
         else:
             logger.info('Voice transcription is disabled')
         
