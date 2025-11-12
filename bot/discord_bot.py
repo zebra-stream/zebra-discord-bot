@@ -700,11 +700,28 @@ class DiscordIntelligenceBot(commands.Bot):
     
     async def store_channel(self, channel, guild):
         """Store channel information"""
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.CategoryChannel)):
+        # Support TextChannel, VoiceChannel, CategoryChannel, and Thread
+        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, 
+                                    discord.CategoryChannel, discord.Thread)):
+            return
+        
+        # For Threads, use the thread's guild or parent channel's guild
+        if isinstance(channel, discord.Thread):
+            if hasattr(channel, 'guild') and channel.guild:
+                guild = channel.guild
+            elif hasattr(channel, 'parent') and channel.parent and hasattr(channel.parent, 'guild'):
+                guild = channel.parent.guild
+        
+        if not guild:
+            logger.warning(f"Cannot store channel {channel.id}: no guild available")
             return
         
         server = await sync_to_async(DiscordServer.objects.get)(server_id=guild.id)
         channel_type = channel.type.name if hasattr(channel.type, 'name') else str(channel.type)
+        
+        # For threads, use a descriptive type
+        if isinstance(channel, discord.Thread):
+            channel_type = f"thread_{channel_type}"
         
         discord_channel, created = await sync_to_async(DiscordChannel.objects.get_or_create)(
             channel_id=channel.id,
@@ -793,8 +810,22 @@ class DiscordIntelligenceBot(commands.Bot):
         try:
             return await sync_to_async(DiscordChannel.objects.get)(channel_id=channel.id)
         except ObjectDoesNotExist:
-            await self.store_channel(channel, channel.guild)
-            return await sync_to_async(DiscordChannel.objects.get)(channel_id=channel.id)
+            # Try to store the channel
+            guild = getattr(channel, 'guild', None)
+            await self.store_channel(channel, guild)
+            
+            # Check if channel was created (store_channel might return early for unsupported types)
+            try:
+                return await sync_to_async(DiscordChannel.objects.get)(channel_id=channel.id)
+            except ObjectDoesNotExist:
+                # Fallback: For Thread channels, use the parent channel
+                if isinstance(channel, discord.Thread) and hasattr(channel, 'parent') and channel.parent:
+                    logger.warning(f"Thread channel {channel.id} not stored, using parent channel {channel.parent.id}")
+                    return await self.get_or_create_channel(channel.parent)
+                
+                # If still not found and it's an unsupported type, log and raise
+                logger.error(f"Could not store channel {channel.id} of type {type(channel).__name__}")
+                raise
     
     async def get_or_create_user(self, member):
         """Get or create user in database"""
