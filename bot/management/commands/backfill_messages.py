@@ -86,18 +86,46 @@ class Command(BaseCommand):
         bot = DiscordIntelligenceBot()
         
         try:
-            # Start bot connection (login and connect)
-            self.stdout.write('Connecting to Discord...')
-            await bot.login(settings.DISCORD_BOT_TOKEN)
-            await bot.connect(reconnect=False)
+            # Login first (with timeout)
+            self.stdout.write('Logging in to Discord...', ending='\n')
+            self.stdout.flush()
+            try:
+                await asyncio.wait_for(bot.login(settings.DISCORD_BOT_TOKEN), timeout=15.0)
+                self.stdout.write('✓ Login successful', ending='\n')
+                self.stdout.flush()
+            except asyncio.TimeoutError:
+                self.stdout.write(self.style.ERROR('✗ Timeout during login (15s)'))
+                raise
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f'✗ Login error: {e}'))
+                raise
+            
+            # Connect to gateway (this starts the websocket connection)
+            self.stdout.write('Connecting to Discord gateway...', ending='\n')
+            self.stdout.flush()
+            # connect() is a coroutine that runs the websocket loop
+            # We need to start it as a background task and wait for ready
+            connect_task = asyncio.create_task(bot.connect(reconnect=False))
             
             # Wait for bot to be ready with timeout
-            self.stdout.write('Waiting for bot to be ready...')
+            self.stdout.write('Waiting for bot to be ready...', ending='\n')
+            self.stdout.flush()
             try:
-                await asyncio.wait_for(bot.wait_until_ready(), timeout=30.0)
+                # Wait for ready event (this happens when connection is established)
+                await asyncio.wait_for(bot.wait_until_ready(), timeout=60.0)
                 self.stdout.write(self.style.SUCCESS('Connected to Discord and ready'))
             except asyncio.TimeoutError:
-                self.stdout.write(self.style.ERROR('Timeout waiting for bot to be ready'))
+                # Cancel the connection task
+                connect_task.cancel()
+                try:
+                    await connect_task
+                except asyncio.CancelledError:
+                    pass
+                self.stdout.write(self.style.ERROR('Timeout waiting for bot to be ready (60s)'))
+                raise
+            except Exception as e:
+                connect_task.cancel()
+                self.stdout.write(self.style.ERROR(f'Connection error: {e}'))
                 raise
             
             # Sync guild data to ensure channels are in database
