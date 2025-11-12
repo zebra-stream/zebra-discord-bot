@@ -6,6 +6,15 @@ from datetime import datetime, timedelta, timezone
 import discord
 import asyncio
 import logging
+
+# Suppress the discord.sinks warning since we don't need voice features for backfilling
+class SinksWarningFilter(logging.Filter):
+    def filter(self, record):
+        return 'discord.sinks' not in record.getMessage()
+
+bot_logger = logging.getLogger('bot.discord_bot')
+bot_logger.addFilter(SinksWarningFilter())
+
 from bot.models import DiscordChannel, DiscordMessage
 from bot.discord_bot import DiscordIntelligenceBot
 
@@ -78,14 +87,21 @@ class Command(BaseCommand):
         
         try:
             # Start bot connection (login and connect)
+            self.stdout.write('Connecting to Discord...')
             await bot.login(settings.DISCORD_BOT_TOKEN)
             await bot.connect(reconnect=False)
             
-            # Wait for bot to be ready
-            await bot.wait_until_ready()
-            self.stdout.write(self.style.SUCCESS('Connected to Discord and ready'))
+            # Wait for bot to be ready with timeout
+            self.stdout.write('Waiting for bot to be ready...')
+            try:
+                await asyncio.wait_for(bot.wait_until_ready(), timeout=30.0)
+                self.stdout.write(self.style.SUCCESS('Connected to Discord and ready'))
+            except asyncio.TimeoutError:
+                self.stdout.write(self.style.ERROR('Timeout waiting for bot to be ready'))
+                raise
             
             # Sync guild data to ensure channels are in database
+            self.stdout.write('Syncing guild data...')
             await bot.sync_guild_data()
             self.stdout.write('Synced guild data')
             
@@ -133,11 +149,19 @@ class Command(BaseCommand):
                 )
             )
             
+        except KeyboardInterrupt:
+            self.stdout.write(self.style.WARNING('\nBackfill interrupted by user'))
+            raise
         except Exception as e:
             self.stdout.write(self.style.ERROR(f'Error during backfill: {e}'))
             logger.error(f"Backfill error: {e}", exc_info=True)
         finally:
-            await bot.close()
+            try:
+                if not bot.is_closed():
+                    await bot.close()
+                self.stdout.write('Disconnected from Discord')
+            except Exception as e:
+                logger.error(f"Error closing bot: {e}")
 
     async def get_channels_to_backfill(self, bot, channel_id, server_id, skip_existing, cutoff_time):
         """Get list of channels to backfill"""
